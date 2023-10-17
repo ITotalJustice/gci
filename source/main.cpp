@@ -7,6 +7,7 @@
 #include <string_view>
 #include <bit>
 #include <experimental/scope>
+#include <threads.h>
 
 namespace {
 
@@ -29,6 +30,9 @@ namespace {
 #endif
 
 #define ON_SCOPE_EXIT(_f) std::experimental::scope_exit ANONYMOUS_VARIABLE(SCOPE_EXIT_STATE_){[&] { _f; }};
+
+constexpr u64 BUFFER_SIZE = 1024*1024*8;
+constexpr float _1MiB = 1024*1024;
 
 enum NsApplicationRecordType {
     // installed
@@ -81,14 +85,102 @@ struct BufHelper {
     u64 offset{};
 };
 
+struct TimeStamp {
+    TimeStamp() {
+        start = armGetSystemTick();
+    }
+
+    auto GetNs() -> u64 {
+        auto end_ticks = armGetSystemTick();
+        return armTicksToNs(end_ticks) - armTicksToNs(start);
+    }
+
+    auto GetSeconds() -> double {
+        const double ns = GetNs();
+        return ns/1000.0/1000.0/1000.0;
+    }
+
+    u64 start;
+};
+
+struct ThreadData {
+    // these need to be created
+    std::vector<u8> buf;
+    mtx_t mtx;
+    cnd_t can_read;
+    cnd_t can_write;
+
+    // these need to be copied
+    FsFile nca_file;
+    NcmContentStorage cs;
+    NcmPlaceHolderId placeholder_id;
+    volatile u64 total_size;
+
+    // these are shared between threads
+    volatile u64 offset{};
+    volatile u64 data_written{};
+    volatile u64 data_size{};
+    volatile Result read_result{};
+    volatile Result write_result{};
+};
+
+void readFunc(void* d) {
+    auto t = static_cast<ThreadData*>(d);
+    std::vector<u8> buf(BUFFER_SIZE);
+
+    u64 done = t->data_written;
+    while (done < t->total_size && R_SUCCEEDED(t->write_result)) {
+        u64 bytes_read{};
+        if (auto rc = fsFileRead(&t->nca_file, t->offset, buf.data(), buf.size(), 0, &bytes_read); R_FAILED(rc)) {
+            t->read_result = rc;
+            return;
+        }
+
+        mtx_lock(&t->mtx);
+        if (t->data_size != 0) {
+            cnd_wait(&t->can_read, &t->mtx);
+        }
+
+        memcpy(t->buf.data(), buf.data(), bytes_read);
+        t->data_size = bytes_read;
+        done += bytes_read;
+        t->offset += bytes_read;
+
+        mtx_unlock(&t->mtx);
+        cnd_signal(&t->can_write);
+    }
+}
+
+void writeFunc(void* d) {
+    auto t = static_cast<ThreadData*>(d);
+
+    while (t->data_written < t->total_size && R_SUCCEEDED(t->read_result)) {
+        mtx_lock(&t->mtx);
+        if (t->data_size == 0) {
+            cnd_wait(&t->can_write, &t->mtx);
+        }
+
+        if (auto rc = ncmContentStorageWritePlaceHolder(&t->cs, &t->placeholder_id, t->data_written, t->buf.data(), t->data_size); R_FAILED(rc)) {
+            t->write_result = rc;
+            return;
+        }
+
+        t->data_written += t->data_size;
+        t->data_size = 0;
+
+        mtx_unlock(&t->mtx);
+        cnd_signal(&t->can_read);
+    }
+}
+
 const NcmContentId nca_get_id_from_string(const char *nca_in_string) {
     NcmContentId nca_id{};
     char lowerU64[0x11]{};
     char upperU64[0x11]{};
     std::memcpy(lowerU64, nca_in_string, 0x10);
     std::memcpy(upperU64, nca_in_string + 0x10, 0x10);
-    *(u64*)nca_id.c = std::byteswap(strtoul(lowerU64, nullptr, 0x10));
-    *(u64*)(nca_id.c + 8) = std::byteswap(strtoul(upperU64, nullptr, 0x10));
+    *(u64*)nca_id.c = std::byteswap(std::strtoul(lowerU64, nullptr, 0x10));
+    *(u64*)(nca_id.c + 8) = std::byteswap(std::strtoul(upperU64, nullptr, 0x10));
     return nca_id;
 }
 
@@ -129,7 +221,7 @@ Result dumb_installer(NcmStorageId storage_id) {
     R_TRY(fsDeviceOperatorIsGameCardInserted(&dev_op, &gc_inserted));
     if (!gc_inserted) {
         consolePrint("No GameCard Inserted!\n");
-        R_THROW(0x1);
+        R_THROW(1);
     }
 
     FsGameCardHandle gc_handle{};
@@ -178,16 +270,47 @@ Result dumb_installer(NcmStorageId storage_id) {
         R_TRY(fsFsOpenFile(&gc_fs, safe_buf, FsOpenMode_Read, &nca_file));
         ON_SCOPE_EXIT(fsFileClose(&nca_file));
 
-        consolePrint("\nwriting placeholder: %s\n\n", nca.name);
-        std::vector<u8> buf(1024*1024);
-        s64 offset{};
-        while (offset < nca.file_size) {
-            u64 bytes_read{};
-            R_TRY(fsFileRead(&nca_file, offset, buf.data(), buf.size(), 0, &bytes_read));
-            R_TRY(ncmContentStorageWritePlaceHolder(&cs, &placeholder_id, offset, buf.data(), bytes_read));
-            constexpr float _1MiB = 1024*1024;
-            consolePrint("* INSTALLING: %.2fMB of %.2fMB *\r", static_cast<float>(offset) / _1MiB, static_cast<float>(nca.file_size) / _1MiB);
-            offset += bytes_read;
+        consolePrint("\nInstalling NCA: %s\n\n", nca.name);
+
+        ThreadData t_data{};
+        mtx_init(&t_data.mtx, mtx_plain);
+        cnd_init(&t_data.can_read);
+        cnd_init(&t_data.can_write);
+        t_data.buf.resize(BUFFER_SIZE);
+
+        t_data.nca_file = nca_file;
+        t_data.cs = cs;
+        t_data.placeholder_id = placeholder_id;
+        t_data.offset = 0;
+        t_data.total_size = nca.file_size;
+
+        Thread t_read{}, t_write{};
+        R_TRY(threadCreate(&t_read, readFunc, &t_data, nullptr, 1024*32, 0x2C, -2));
+        R_TRY(threadCreate(&t_write, writeFunc, &t_data, nullptr, 1024*32, 0x2C, -2));
+        R_TRY(threadStart(&t_read));
+        R_TRY(threadStart(&t_write));
+
+        // loop until file has finished installing.
+        while (t_data.data_written != t_data.total_size && R_SUCCEEDED(t_data.read_result) && R_SUCCEEDED(t_data.write_result)) {
+            consolePrint("* INSTALLING: %.2fMB of %.2fMB *\r", static_cast<float>(t_data.data_written) / _1MiB, static_cast<float>(nca.file_size) / _1MiB);
+            svcSleepThread(33'333'333);
+        }
+        consolePrint("\n");
+
+        R_TRY(threadWaitForExit(&t_read));
+        R_TRY(threadWaitForExit(&t_write));
+        R_TRY(threadClose(&t_read));
+        R_TRY(threadClose(&t_write));
+        mtx_destroy(&t_data.mtx);
+        cnd_destroy(&t_data.can_read);
+        cnd_destroy(&t_data.can_write);
+
+        if (R_FAILED(t_data.read_result)) {
+            consolePrint("error installing in readThread: %X\n", t_data.read_result);
+            R_THROW(t_data.read_result);
+        } else if (R_FAILED(t_data.write_result)) {
+            consolePrint("error installing in writeThread: %X\n", t_data.write_result);
+            R_THROW(t_data.write_result);
         }
 
         ncmContentStorageDelete(&cs, &content_id);
@@ -318,28 +441,24 @@ Result dumb_installer(NcmStorageId storage_id) {
 
 } // namespace
 
-// called before main
 extern "C" void userAppInit(void) {
-    Result rc;
-    if (R_FAILED(rc = appletLockExit())) // block exit until everything is cleaned up
-        diagAbortWithResult(rc);
-    if (R_FAILED(rc = socketInitializeDefault()))
-        diagAbortWithResult(rc);
+    appletLockExit();
 }
 
-// called after main has exit
 extern "C" void userAppExit(void) {
-    socketExit();
-    appletUnlockExit(); // unblocks exit to cleanly exit
+    appletUnlockExit();
 }
 
 int main(void) {
     consoleInit(nullptr);
     ON_SCOPE_EXIT(consoleExit(nullptr));
 
-    dumb_installer(NcmStorageId_SdCard);
+    TimeStamp ts;
+    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+        dumb_installer(NcmStorageId_SdCard);
+    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
 
-    consolePrint("Press (+) to exit\n\n");
+    consolePrint("Press (+) to exit, time taken: %.2fs\n\n", ts.GetSeconds());
 
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
