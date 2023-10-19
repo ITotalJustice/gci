@@ -38,6 +38,16 @@ namespace {
 
 constexpr u64 BUFFER_SIZE = 1024*1024*4;
 constexpr double _1MiB = 1024*1024;
+constexpr bool KEEP_DISTRIBUTION_BIT{};
+
+constexpr u8 HEADER_KEK_SRC[0x10] = {
+    0x1F, 0x12, 0x91, 0x3A, 0x4A, 0xCB, 0xF0, 0x0D, 0x4C, 0xDE, 0x3A, 0xF6, 0xD5, 0x23, 0x88, 0x2A
+};
+
+constexpr u8 HEADER_KEY_SRC[0x20] = {
+    0x5A, 0x3E, 0xD8, 0x4F, 0xDE, 0xC0, 0xD8, 0x26, 0x31, 0xF7, 0xE2, 0x5D, 0x19, 0x7B, 0xF5, 0xD0,
+    0x1C, 0x9B, 0x7B, 0xFA, 0xF6, 0x28, 0x18, 0x3D, 0x71, 0xF6, 0x4D, 0x73, 0xF1, 0x50, 0xB9, 0xD2
+};
 
 enum NsApplicationRecordType {
     // installed
@@ -52,6 +62,118 @@ struct NcmContentStorageRecord {
     NcmContentMetaKey key;
     u8 storage_id;
     u8 padding[0x7];
+};
+
+enum NcaDistributionType {
+    NcaDistributionType_System   = 0x0,
+    NcaDistributionType_GameCard = 0x1
+};
+
+enum NcaContentType {
+    NcaContentType_Program    = 0x0,
+    NcaContentType_Meta       = 0x1,
+    NcaContentType_Control    = 0x2,
+    NcaContentType_Manual     = 0x3,
+    NcaContentType_Data       = 0x4,
+    NcaContentType_PublicData = 0x5,
+};
+
+struct NcaSectionTableEntry {
+    u32 media_start_offset; // divided by 0x200.
+    u32 media_end_offset;   // divided by 0x200.
+    u8 _0x8[0x4];           // unknown.
+    u8 _0xC[0x4];           // unknown.
+};
+
+struct LayerRegion {
+    u64 offset;
+    u64 size;
+};
+
+struct HierarchicalSha256Data {
+    u8 master_hash[0x20];
+    u32 block_size;
+    u32 layer_count;
+    LayerRegion hash_layer;
+    LayerRegion pfs0_layer;
+    LayerRegion unused_layers[3];
+    u8 _0x78[0x80];
+};
+
+#pragma pack(push, 1)
+struct HierarchicalIntegrityVerificationLevelInformation {
+    u64 logical_offset;
+    u64 hash_data_size;
+    u32 block_size; // log2
+    u32 _0x14; // reserved
+};
+#pragma pack(pop)
+
+struct InfoLevelHash {
+    u32 max_layers;
+    HierarchicalIntegrityVerificationLevelInformation levels[6];
+    u8 signature_salt[0x20];
+};
+
+struct IntegrityMetaInfo {
+    u32 magic; // IVFC
+    u32 version;
+    u32 master_hash_size;
+    InfoLevelHash info_level_hash;
+    u8 master_hash[0x20];
+    u8 _0xE0[0x18];
+};
+
+struct NcaFsHeader {
+    u16 version;           // always 2.
+    u8 fs_type;            // see NcaFileSystemType.
+    u8 hash_type;          // see NcaHashType.
+    u8 encryption_type;    // see NcaEncryptionType.
+    u8 metadata_hash_type;
+    u8 _0x6[0x2];          // empty.
+
+    union {
+        HierarchicalSha256Data hierarchical_sha256_data;
+        IntegrityMetaInfo integrity_meta_info; // used for romfs
+    } hash_data;
+
+    u8 patch_info[0x40];
+    u64 section_ctr;
+    u8 spares_info[0x30];
+    u8 compression_info[0x28];
+    u8 meta_data_hash_data_info[0x30];
+    u8 reserved[0x30];
+};
+
+struct NcaSectionHeaderHash {
+    u8 sha256[0x20];
+};
+
+struct NcaKeyArea {
+    u8 area[0x10];
+};
+
+struct NcaHeader {
+    u8 rsa_fixed_key[0x100];
+    u8 rsa_npdm[0x100];        // key from npdm.
+    u32 magic;
+    u8 distribution_type;      // NcaDistributionType.
+    u8 content_type;           // NcaContentType.
+    u8 old_key_gen;            // NcaOldKeyGeneration.
+    u8 kaek_index;             // NcaKeyAreaEncryptionKeyIndex.
+    u64 size;
+    u64 title_id;
+    u32 context_id;
+    u32 sdk_version;
+    u8 key_gen;                // NcaKeyGeneration.
+    u8 header_1_sig_key_gen;
+    u8 _0x222[0xE];            // empty.
+    FsRightsId rights_id;
+    NcaSectionTableEntry fs_table[0x4];
+    NcaSectionHeaderHash fs_header_hash[0x4];
+    NcaKeyArea key_area[0x4];
+    u8 _0x340[0xC0];           // empty.
+    NcaFsHeader fs_header[0x4];
 };
 
 union NcmExtendedHeader {
@@ -154,12 +276,11 @@ struct ThreadData {
     // these need to be copied
     FsFile nca_file;
     NcmContentStorage cs;
-    NcmPlaceHolderId placeholder_id;
-    volatile u64 total_size;
+    const NcmPlaceHolderId placeholder_id;
+    const u64 total_size;
 
     // these are shared between threads
-    volatile u64 offset{};
-    volatile u64 data_written{};
+    volatile u64 write_offset{};
     volatile u64 data_size{};
     volatile Result read_result{};
     volatile Result write_result{};
@@ -181,10 +302,10 @@ void readFunc(void* d) {
     auto t = static_cast<ThreadData*>(d);
     std::vector<u8> buf(BUFFER_SIZE);
 
-    u64 done = t->data_written;
+    u64 done = t->write_offset;
     while (done < t->total_size && R_SUCCEEDED(t->write_result)) {
         u64 bytes_read;
-        if (auto rc = fsFileRead(std::addressof(t->nca_file), t->offset, buf.data(), buf.size(), FsReadOption_None, std::addressof(bytes_read)); R_FAILED(rc)) {
+        if (auto rc = fsFileRead(std::addressof(t->nca_file), done, buf.data(), buf.size(), FsReadOption_None, std::addressof(bytes_read)); R_FAILED(rc)) {
             t->read_result = rc;
             return;
         }
@@ -197,7 +318,6 @@ void readFunc(void* d) {
         std::memcpy(t->buf.data(), buf.data(), bytes_read);
         t->data_size = bytes_read;
         done += bytes_read;
-        t->offset += bytes_read;
 
         mutexUnlock(std::addressof(t->mutex));
         condvarWakeOne(std::addressof(t->can_write));
@@ -207,22 +327,36 @@ void readFunc(void* d) {
 void writeFunc(void* d) {
     auto t = static_cast<ThreadData*>(d);
 
-    while (t->data_written < t->total_size && R_SUCCEEDED(t->read_result)) {
+    while (t->write_offset < t->total_size && R_SUCCEEDED(t->read_result)) {
         mutexLock(std::addressof(t->mutex));
         if (t->data_size == 0) {
             condvarWait(std::addressof(t->can_write), std::addressof(t->mutex));
         }
 
-        if (auto rc = ncmContentStorageWritePlaceHolder(std::addressof(t->cs), std::addressof(t->placeholder_id), t->data_written, t->buf.data(), t->data_size); R_FAILED(rc)) {
+        if (auto rc = ncmContentStorageWritePlaceHolder(std::addressof(t->cs), std::addressof(t->placeholder_id), t->write_offset, t->buf.data(), t->data_size); R_FAILED(rc)) {
             t->write_result = rc;
             return;
         }
 
-        t->data_written += t->data_size;
+        t->write_offset += t->data_size;
         t->data_size = 0;
 
         mutexUnlock(std::addressof(t->mutex));
         condvarWakeOne(std::addressof(t->can_read));
+    }
+}
+
+void ncaHeaderEncrypt(const void* in, void* out, const void* key, u64 sector, u64 sector_size, u64 data_size, bool is_encryptor) {
+    Aes128XtsContext ctx;
+    aes128XtsContextCreate(std::addressof(ctx), key, static_cast<const u8*>(key) + 0x10, is_encryptor);
+
+    for (u64 pos = 0; pos < data_size; pos += sector_size) {
+        aes128XtsContextResetSector(std::addressof(ctx), sector++, true);
+        if (is_encryptor) {
+            aes128XtsEncrypt(std::addressof(ctx), static_cast<u8*>(out) + pos, static_cast<const u8*>(in) + pos, sector_size);
+        } else {
+            aes128XtsDecrypt(std::addressof(ctx), static_cast<u8*>(out) + pos, static_cast<const u8*>(in) + pos, sector_size);
+        }
     }
 }
 
@@ -408,6 +542,34 @@ Result gci_install(NcmStorageId storage_id) {
                 ON_SCOPE_EXIT(fsFileClose(std::addressof(nca_file)));
 
                 ThreadData t_data{nca_file, cs, placeholder_id, nca_size};
+
+                if (!KEEP_DISTRIBUTION_BIT && meta_type == NcmContentMetaType_Application) {
+                    consolePrint("! Changing distribution bit !\n\n");
+                    NcaHeader nca_header;
+                    u64 bytes_read;
+                    R_TRY(fsFileRead(std::addressof(nca_file), 0, std::addressof(nca_header), sizeof(nca_header), 0, std::addressof(bytes_read)));
+                    R_UNLESS(bytes_read > 0, "Size is empty!");
+
+                    R_TRY(splCryptoInitialize());
+                    ON_SCOPE_EXIT(splCryptoExit());
+
+                    u8 header_kek[0x20];
+                    u8 key[0x20];
+                    R_TRY(splCryptoGenerateAesKek(HEADER_KEK_SRC, 0, 0, header_kek));
+                    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC, key));
+                    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC + 0x10, key + 0x10));
+
+                    ncaHeaderEncrypt(std::addressof(nca_header), std::addressof(nca_header), key, 0, 0x200, sizeof(nca_header), false);
+                    R_UNLESS(nca_header.magic == 0x3341434E, "Wrong NCA magic!");
+
+                    nca_header.distribution_type = NcaDistributionType_System;
+                    ncaHeaderEncrypt(std::addressof(nca_header), std::addressof(nca_header), key, 0, 0x200, sizeof(nca_header), true);
+                    R_UNLESS(nca_header.magic != 0x3341434E, "NCA magic after encryption!");
+
+                    R_TRY(ncmContentStorageWritePlaceHolder(std::addressof(cs), std::addressof(placeholder_id), 0, std::addressof(nca_header), sizeof(nca_header)));
+                    t_data.write_offset += sizeof(nca_header);
+                }
+
                 Thread t_read, t_write;
                 R_TRY(threadCreate(std::addressof(t_read), readFunc, std::addressof(t_data), nullptr, 1024*32, 0x2C, -2));
                 R_TRY(threadCreate(std::addressof(t_write), writeFunc, std::addressof(t_data), nullptr, 1024*32, 0x2C, -2));
@@ -418,14 +580,14 @@ Result gci_install(NcmStorageId storage_id) {
                 TimeStamp clock{};
                 double speed{};
                 double written{};
-                while (t_data.data_written != t_data.total_size && R_SUCCEEDED(t_data.read_result) && R_SUCCEEDED(t_data.write_result)) {
+                while (t_data.write_offset != t_data.total_size && R_SUCCEEDED(t_data.read_result) && R_SUCCEEDED(t_data.write_result)) {
                     if (clock.GetSeconds() >= 1.0) {
-                        const double new_written = t_data.data_written;
+                        const double new_written = t_data.write_offset;
                         speed = (new_written - written) / _1MiB;
                         written = new_written;
                         clock.Reset();
                     }
-                    consolePrint("* INSTALLING: %.2fMB of %.2fMB %.2fMB/s*\r", static_cast<double>(t_data.data_written) / _1MiB, static_cast<double>(nca_size) / _1MiB, speed);
+                    consolePrint("* INSTALLING: %.2fMB of %.2fMB %.2fMB/s*\r", static_cast<double>(t_data.write_offset) / _1MiB, static_cast<double>(nca_size) / _1MiB, speed);
                     svcSleepThread(33'333'333);
                 }
                 consolePrint("\n");
@@ -439,7 +601,7 @@ Result gci_install(NcmStorageId storage_id) {
                 R_UNLESS(R_SUCCEEDED(t_data.write_result), "writeThread");
 
                 bool has_content;
-                R_TRY(ncmContentStorageHas(std::addressof(cs), std::addressof(has_content), &content_info.content_id));
+                R_TRY(ncmContentStorageHas(std::addressof(cs), std::addressof(has_content), std::addressof(content_info.content_id)));
                 if (has_content) {
                     R_TRY(ncmContentStorageDelete(std::addressof(cs), std::addressof(content_info.content_id)));
                 }
