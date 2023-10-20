@@ -38,16 +38,31 @@ namespace {
 
 constexpr u64 BUFFER_SIZE = 1024*1024*4;
 constexpr double _1MiB = 1024*1024;
-constexpr bool KEEP_DISTRIBUTION_BIT{};
 
-constexpr u8 HEADER_KEK_SRC[0x10] = {
-    0x1F, 0x12, 0x91, 0x3A, 0x4A, 0xCB, 0xF0, 0x0D, 0x4C, 0xDE, 0x3A, 0xF6, 0xD5, 0x23, 0x88, 0x2A
-};
+constexpr u32 KEYGEN_LIMIT = 0x20;
 
-constexpr u8 HEADER_KEY_SRC[0x20] = {
-    0x5A, 0x3E, 0xD8, 0x4F, 0xDE, 0xC0, 0xD8, 0x26, 0x31, 0xF7, 0xE2, 0x5D, 0x19, 0x7B, 0xF5, 0xD0,
-    0x1C, 0x9B, 0x7B, 0xFA, 0xF6, 0x28, 0x18, 0x3D, 0x71, 0xF6, 0x4D, 0x73, 0xF1, 0x50, 0xB9, 0xD2
-};
+constexpr u8 HEADER_KEK_SRC[0x10] = { 0x1F, 0x12, 0x91, 0x3A, 0x4A, 0xCB, 0xF0, 0x0D, 0x4C, 0xDE, 0x3A, 0xF6, 0xD5, 0x23, 0x88, 0x2A };
+constexpr u8 HEADER_KEY_SRC[0x20] = { 0x5A, 0x3E, 0xD8, 0x4F, 0xDE, 0xC0, 0xD8, 0x26, 0x31, 0xF7, 0xE2, 0x5D, 0x19, 0x7B, 0xF5, 0xD0, 0x1C, 0x9B, 0x7B, 0xFA, 0xF6, 0x28, 0x18, 0x3D, 0x71, 0xF6, 0x4D, 0x73, 0xF1, 0x50, 0xB9, 0xD2 };
+constexpr u8 g_keak_application_source[0x10] = { 0x7F, 0x59, 0x97, 0x1E, 0x62, 0x9F, 0x36, 0xA1, 0x30, 0x98, 0x06, 0x6F, 0x21, 0x44, 0xC3, 0x0D };
+constexpr u8 g_keak_ocean_source[0x10] = { 0x32, 0x7D, 0x36, 0x08, 0x5A, 0xD1, 0x75, 0x8D, 0xAB, 0x4E, 0x6F, 0xBA, 0xA5, 0x55, 0xD8, 0x82 };
+constexpr u8 g_keak_system_source[0x10] = { 0x87, 0x45, 0xF1, 0xBB, 0xA6, 0xBE, 0x79, 0x64, 0x7D, 0x04, 0x8B, 0xA6, 0x7B, 0x5F, 0xDA, 0x4A };
+constexpr u8 g_titlekey_source[0x10] = { 0x1e, 0xdc, 0x7b, 0x3b, 0x60, 0xe6, 0xb4, 0xd8, 0x78, 0xb8, 0x17, 0x15, 0x98, 0x5e, 0x62, 0x9b };
+
+// changes distribution bit in nca header to 0.
+bool FIX_DISTRIBUTION_BIT{false};
+
+// converts titlekey to standard crypto, also known as "ticketless".
+// this will not work with addon, so, addon tickets will be installed.
+bool CONVERT_TO_STANDARD_CRYTPO{false};
+
+// encrypts the keak with master key 0, this allows the game to be launched
+// on every fw. Also implicitly does standard crypto.
+bool LOWER_MASTER_KEY{false};
+
+// sets the system_firmware field in the cnmt extended header.
+// if mkey is higher than fw version, the game still won't launch
+// as the fw won't have the key to decrypt keak.
+bool LOWER_SYSTEM_VERSION{false};
 
 enum NsApplicationRecordType {
     // installed
@@ -62,6 +77,37 @@ struct NcmContentStorageRecord {
     NcmContentMetaKey key;
     u8 storage_id;
     u8 padding[0x7];
+};
+
+enum NcaOldKeyGeneration {
+    NcaOldKeyGeneration_100    = 0x0,
+    NcaOldKeyGeneration_Unused = 0x1,
+    NcaOldKeyGeneration_300    = 0x2,
+};
+
+enum NcaKeyGeneration {
+    NcaKeyGeneration_301     = 0x3,
+    NcaKeyGeneration_400     = 0x4,
+    NcaKeyGeneration_500     = 0x5,
+    NcaKeyGeneration_600     = 0x6,
+    NcaKeyGeneration_620     = 0x7,
+    NcaKeyGeneration_700     = 0x8,
+    NcaKeyGeneration_810     = 0x9,
+    NcaKeyGeneration_900     = 0x0A,
+    NcaKeyGeneration_910     = 0x0B,
+    NcaKeyGeneration_1210    = 0x0C,
+    NcaKeyGeneration_1300    = 0x0D,
+    NcaKeyGeneration_1400    = 0x0E,
+    NcaKeyGeneration_1500    = 0x0F,
+    NcaKeyGeneration_1600    = 0x10,
+    NcaKeyGeneration_1700    = 0x11,
+    NcaKeyGeneration_Invalid = 0xFF
+};
+
+enum NcaKeyAreaEncryptionKeyIndex {
+    NcaKeyAreaEncryptionKeyIndex_Application = 0x0,
+    NcaKeyAreaEncryptionKeyIndex_Ocean       = 0x1,
+    NcaKeyAreaEncryptionKeyIndex_System      = 0x2
 };
 
 enum NcaDistributionType {
@@ -131,12 +177,10 @@ struct NcaFsHeader {
     u8 encryption_type;    // see NcaEncryptionType.
     u8 metadata_hash_type;
     u8 _0x6[0x2];          // empty.
-
     union {
         HierarchicalSha256Data hierarchical_sha256_data;
         IntegrityMetaInfo integrity_meta_info; // used for romfs
     } hash_data;
-
     u8 patch_info[0x40];
     u64 section_ctr;
     u8 spares_info[0x30];
@@ -290,12 +334,140 @@ struct HashStr {
     char str[0x21];
 };
 
+using KeySection = std::vector<NcaKeyArea>;
+struct Keys {
+    KeySection keak[0x3]; // index
+    KeySection title_kek;
+    KeySection mkey;
+    u8 header_key[0x20];
+
+    static auto FixKey(u8 key) -> u8 {
+        if (key) {
+            return key - 1;
+        }
+        return key;
+    }
+
+    auto HasNcaKeyArea(u8 key, u8 index) const {
+        return FixKey(key) <= keak[index].size();
+    }
+
+    auto HasTitleKek(u8 key) const {
+        return FixKey(key) <= title_kek.size();
+    }
+
+    auto HasMasterKey(u8 key) const {
+        return FixKey(key) <= mkey.size();
+    }
+
+    auto GetNcaKeyArea(NcaKeyArea* out, u8 key, u8 index) const {
+        *out = keak[index][FixKey(key)];
+    }
+
+    auto GetTitleKek(NcaKeyArea* out, u8 key) const {
+        *out = title_kek[FixKey(key)];
+    }
+
+    auto GetMasterKey(NcaKeyArea* out, u8 key) const {
+        *out = mkey[FixKey(key)];
+    }
+};
+
 HashStr hexIdToStr(auto id) {
     HashStr str{};
     const auto id_lower = std::byteswap(*(u64*)id.c);
     const auto id_upper = std::byteswap(*(u64*)(id.c + 0x8));
     std::snprintf(str.str, 0x21, "%016lx%016lx", id_lower, id_upper);
     return str;
+}
+
+auto isRightsIdValid(FsRightsId id) -> bool {
+    FsRightsId empty_id{};
+    return 0 != std::memcmp(std::addressof(id), std::addressof(empty_id), sizeof(id));
+}
+
+auto getKeyGenFromRightsId(FsRightsId id) -> u8 {
+    return id.c[sizeof(id) - 1];
+}
+
+void parse_hex_key(NcaKeyArea* keak, const char* hex) {
+    char low[0x11]{};
+    char upp[0x11]{};
+    std::memcpy(low, hex, 0x10);
+    std::memcpy(upp, hex + 0x10, 0x10);
+    *(u64*)keak->area = std::byteswap<u64>(std::strtoul(low, nullptr, 0x10));
+    *(u64*)(keak->area + 8) = std::byteswap<u64>(std::strtoul(upp, nullptr, 0x10));
+}
+
+void find_keys_in_file(const char* loaded_file, const char* search_key, KeySection& key_section) {
+    auto ed = loaded_file;
+    char parse_string[0x100] = {0};
+    const auto skip = std::strlen(search_key) + 2 + 3;  // two extra hex + 2 spaces and =.
+
+    for (u8 i = 0; i < KEYGEN_LIMIT; i++) {
+        std::sprintf(parse_string, "%s%02x", search_key, i);
+        if (!(ed = std::strstr(ed, parse_string)))
+            break;
+        ed += skip;
+        #if 0
+        consolePrint("found %s: %.32s\n", parse_string, ed);
+        #endif
+
+        NcaKeyArea keak;
+        parse_hex_key(&keak, ed);
+        key_section.emplace_back(keak);
+        ed += (sizeof(keak) * 2) + 1;
+    }
+}
+
+Result readKeyFile(std::vector<char>& out) {
+    FsFileSystem fs;
+    R_TRY(fsOpenSdCardFileSystem(std::addressof(fs)));
+    ON_SCOPE_EXIT(fsFsClose(std::addressof(fs)));
+
+    FsFile file;
+    const char keys_path[FS_MAX_PATH]{"/switch/prod.keys"};
+    R_TRY(fsFsOpenFile(std::addressof(fs), keys_path, FsOpenMode_Read, std::addressof(file)));
+    ON_SCOPE_EXIT(fsFileClose(std::addressof(file)));
+
+    s64 size;
+    R_TRY(fsFileGetSize(&file, &size));
+    R_UNLESS(size > 0, "Empty keys file!");
+    R_UNLESS(size < 1024*1024, "Huge keys file!");
+
+    out.resize(size);
+    u64 bytes_read;
+    R_TRY(fsFileRead(&file, 0, out.data(), out.size(), FsReadOption_None, &bytes_read));
+    R_UNLESS(bytes_read == static_cast<u64>(size), "Missmatch");
+
+    R_SUCCEED();
+}
+
+Result parse_keys(Keys& out) {
+    std::vector<char> buf;
+    R_TRY(readKeyFile(buf));
+
+    const char* key_text_keak_app = "key_area_key_application_";
+    const char* key_text_keak_oce = "key_area_key_ocean_";
+    const char* key_text_keak_sys = "key_area_key_system_";
+    const char* key_text_title_kek = "titlekek_";
+    const char* key_text_mkey = "master_key_";
+
+    find_keys_in_file(buf.data(), key_text_keak_app, out.keak[NcaKeyAreaEncryptionKeyIndex_Application]);
+    find_keys_in_file(buf.data(), key_text_keak_oce, out.keak[NcaKeyAreaEncryptionKeyIndex_Ocean]);
+    find_keys_in_file(buf.data(), key_text_keak_sys, out.keak[NcaKeyAreaEncryptionKeyIndex_System]);
+    find_keys_in_file(buf.data(), key_text_title_kek, out.title_kek);
+    find_keys_in_file(buf.data(), key_text_mkey, out.mkey);
+
+    R_TRY(splCryptoInitialize());
+    ON_SCOPE_EXIT(splCryptoExit());
+
+    u8 header_kek[0x20];
+    R_TRY(splCryptoGenerateAesKek(HEADER_KEK_SRC, 0, 0, header_kek));
+    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC, out.header_key));
+    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC + 0x10, out.header_key + 0x10));
+
+    R_SUCCEED();
 }
 
 void readFunc(void* d) {
@@ -346,7 +518,18 @@ void writeFunc(void* d) {
     }
 }
 
-void ncaHeaderEncrypt(const void* in, void* out, const void* key, u64 sector, u64 sector_size, u64 data_size, bool is_encryptor) {
+void cryptoAes128(const void *in, void *out, const void* key, bool is_encryptor) {
+    Aes128Context ctx;
+    aes128ContextCreate(&ctx, key, is_encryptor);
+
+    if (is_encryptor) {
+        aes128EncryptBlock(&ctx, out, in);
+    } else {
+        aes128DecryptBlock(&ctx, out, in);
+    }
+}
+
+void cryptoAes128Xts(const void* in, void* out, const void* key, u64 sector, u64 sector_size, u64 data_size, bool is_encryptor) {
     Aes128XtsContext ctx;
     aes128XtsContextCreate(std::addressof(ctx), key, static_cast<const u8*>(key) + 0x10, is_encryptor);
 
@@ -487,6 +670,9 @@ Result gci_install(NcmStorageId storage_id) {
     GciEntries entries;
     R_TRY(gci_parse(entries));
 
+    Keys keys;
+    R_TRY(parse_keys(keys));
+
     #if 1
     FsGameCardHandle gc_handle;
     R_TRY(fsDeviceOperatorGetGameCardHandle(std::addressof(dev_op), std::addressof(gc_handle)));
@@ -541,34 +727,91 @@ Result gci_install(NcmStorageId storage_id) {
                 R_TRY(fsFsOpenFile(std::addressof(fs), safe_buf, FsOpenMode_Read, std::addressof(nca_file)));
                 ON_SCOPE_EXIT(fsFileClose(std::addressof(nca_file)));
 
-                ThreadData t_data{nca_file, cs, placeholder_id, nca_size};
+                NcaHeader nca_header;
+                u64 bytes_read;
+                R_TRY(fsFileRead(std::addressof(nca_file), 0, std::addressof(nca_header), sizeof(nca_header), 0, std::addressof(bytes_read)));
+                R_UNLESS(bytes_read > 0, "Size is empty!");
 
-                if (!KEEP_DISTRIBUTION_BIT && meta_type == NcmContentMetaType_Application) {
-                    consolePrint("! Changing distribution bit !\n\n");
-                    NcaHeader nca_header;
-                    u64 bytes_read;
-                    R_TRY(fsFileRead(std::addressof(nca_file), 0, std::addressof(nca_header), sizeof(nca_header), 0, std::addressof(bytes_read)));
-                    R_UNLESS(bytes_read > 0, "Size is empty!");
+                cryptoAes128Xts(std::addressof(nca_header), std::addressof(nca_header), keys.header_key, 0, 0x200, sizeof(nca_header), false);
+                R_UNLESS(nca_header.magic == 0x3341434E, "Wrong NCA magic!");
 
-                    R_TRY(splCryptoInitialize());
-                    ON_SCOPE_EXIT(splCryptoExit());
-
-                    u8 header_kek[0x20];
-                    u8 key[0x20];
-                    R_TRY(splCryptoGenerateAesKek(HEADER_KEK_SRC, 0, 0, header_kek));
-                    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC, key));
-                    R_TRY(splCryptoGenerateAesKey(header_kek, HEADER_KEY_SRC + 0x10, key + 0x10));
-
-                    ncaHeaderEncrypt(std::addressof(nca_header), std::addressof(nca_header), key, 0, 0x200, sizeof(nca_header), false);
-                    R_UNLESS(nca_header.magic == 0x3341434E, "Wrong NCA magic!");
-
+                if (FIX_DISTRIBUTION_BIT) {
                     nca_header.distribution_type = NcaDistributionType_System;
-                    ncaHeaderEncrypt(std::addressof(nca_header), std::addressof(nca_header), key, 0, 0x200, sizeof(nca_header), true);
-                    R_UNLESS(nca_header.magic != 0x3341434E, "NCA magic after encryption!");
-
-                    R_TRY(ncmContentStorageWritePlaceHolder(std::addressof(cs), std::addressof(placeholder_id), 0, std::addressof(nca_header), sizeof(nca_header)));
-                    t_data.write_offset += sizeof(nca_header);
                 }
+
+                if ((CONVERT_TO_STANDARD_CRYTPO && isRightsIdValid(nca_header.rights_id)) || LOWER_MASTER_KEY) {
+                    u8 keak_generation;
+
+                    if (isRightsIdValid(nca_header.rights_id)) {
+                        const auto key_gen = getKeyGenFromRightsId(nca_header.rights_id);
+                        consolePrint("converting to standard crypto: 0x%X 0x%X\n", key_gen, nca_header.key_gen);
+
+                        char tik_name[FS_MAX_PATH];
+                        std::sprintf(tik_name, "/%s.tik", hexIdToStr(nca_header.rights_id).str);
+
+                        FsFile tik_file;
+                        R_TRY(fsFsOpenFile(std::addressof(fs), tik_name, FsOpenMode_Read, std::addressof(tik_file)));
+                        ON_SCOPE_EXIT(fsFileClose(std::addressof(tik_file)));
+
+                        NcaKeyArea title_key;
+                        u64 tik_read_bytes;
+                        R_TRY(fsFileRead(std::addressof(tik_file), 0x180, &title_key, sizeof(title_key), FsReadOption_None, std::addressof(tik_read_bytes)));
+                        R_UNLESS(tik_read_bytes == sizeof(title_key), "Missmatch!");
+
+                        NcaKeyArea title_kek;
+                        R_UNLESS(keys.HasTitleKek(key_gen), "Missing TitleKek");
+                        keys.GetTitleKek(&title_kek, key_gen);
+                        cryptoAes128(&title_key, &title_key, &title_kek, false);
+
+                        std::memset(nca_header.key_area, 0, sizeof(nca_header.key_area));
+                        nca_header.key_area[0x2] = title_key;
+
+                        keak_generation = key_gen;
+                    } else if (LOWER_MASTER_KEY) {
+                        u8 key_generation = nca_header.key_gen;
+                        if (!nca_header.key_gen) {
+                            key_generation = nca_header.old_key_gen;
+                        }
+
+                        NcaKeyArea keak;
+                        R_UNLESS(keys.HasNcaKeyArea(key_generation, nca_header.kaek_index), "Missing MasterKey");
+                        keys.GetNcaKeyArea(&keak, key_generation, nca_header.kaek_index);
+
+                        for (auto& key_area : nca_header.key_area) {
+                            cryptoAes128(std::addressof(key_area), std::addressof(key_area), std::addressof(keak), false);
+                        }
+                    }
+
+                    if (LOWER_MASTER_KEY) {
+                        keak_generation = 0;
+                    }
+
+                    NcaKeyArea keak;
+                    R_UNLESS(keys.HasNcaKeyArea(keak_generation, nca_header.kaek_index), "Missing MasterKey");
+                    keys.GetNcaKeyArea(&keak, keak_generation, nca_header.kaek_index);
+                    consolePrint("re-ecnrypting with: 0x%X\n", keak_generation);
+
+                    for (auto& key_area : nca_header.key_area) {
+                        cryptoAes128(std::addressof(key_area), std::addressof(key_area), std::addressof(keak), true);
+                    }
+
+                    std::memset(&nca_header.rights_id, 0, sizeof(nca_header.rights_id));
+
+                    if (keak_generation > NcaOldKeyGeneration_300) {
+                        nca_header.key_gen = keak_generation;
+                        nca_header.old_key_gen = NcaOldKeyGeneration_300;
+                    } else {
+                        nca_header.key_gen = 0;
+                        nca_header.old_key_gen = keak_generation;
+                    }
+                }
+
+                cryptoAes128Xts(std::addressof(nca_header), std::addressof(nca_header), keys.header_key, 0, 0x200, sizeof(nca_header), true);
+                R_UNLESS(nca_header.magic != 0x3341434E, "NCA magic after encryption!");
+                R_TRY(ncmContentStorageWritePlaceHolder(std::addressof(cs), std::addressof(placeholder_id), 0, std::addressof(nca_header), sizeof(nca_header)));
+
+                ThreadData t_data{nca_file, cs, placeholder_id, nca_size};
+                t_data.write_offset += sizeof(nca_header);
 
                 Thread t_read, t_write;
                 R_TRY(threadCreate(std::addressof(t_read), readFunc, std::addressof(t_data), nullptr, 1024*32, 0x2C, -2));
@@ -576,7 +819,6 @@ Result gci_install(NcmStorageId storage_id) {
                 R_TRY(threadStart(std::addressof(t_read)));
                 R_TRY(threadStart(std::addressof(t_write)));
 
-                // loop until file has finished installing.
                 TimeStamp clock{};
                 double speed{};
                 double written{};
@@ -587,7 +829,7 @@ Result gci_install(NcmStorageId storage_id) {
                         written = new_written;
                         clock.Reset();
                     }
-                    consolePrint("* INSTALLING: %.2fMB of %.2fMB %.2fMB/s*\r", static_cast<double>(t_data.write_offset) / _1MiB, static_cast<double>(nca_size) / _1MiB, speed);
+                    consolePrint("* INSTALLING: %.2fMB of %.2fMB %.2fMB/s *\r", static_cast<double>(t_data.write_offset) / _1MiB, static_cast<double>(nca_size) / _1MiB, speed);
                     svcSleepThread(33'333'333);
                 }
                 consolePrint("\n");
@@ -610,9 +852,15 @@ Result gci_install(NcmStorageId storage_id) {
 
             // set the database
             {
+                NcmExtendedHeader extended_header = entry.extended_header;
+                if (LOWER_SYSTEM_VERSION) {
+                    R_UNLESS(entry.GetType() != NcmContentMetaType_DataPatch, "Not yet handled");
+                    extended_header.application.required_system_version = 0;
+                }
+
                 BufHelper content_meta_data;
                 content_meta_data.write(std::addressof(entry.content_meta_header), sizeof(entry.content_meta_header));
-                content_meta_data.write(std::addressof(entry.extended_header), entry.content_meta_header.extended_header_size);
+                content_meta_data.write(std::addressof(extended_header), entry.content_meta_header.extended_header_size);
                 content_meta_data.write(entry.content_infos.data(), sizeof(NcmContentInfo) * entry.content_infos.size());
 
                 NcmContentMetaDatabase db;
@@ -670,8 +918,8 @@ Result gci_install(NcmStorageId storage_id) {
                 // nsDeleteRedundantApplicationEntity();
             }
 
-            // install tickets
-            if (entry.IsRightsIdValid()) {
+            // install ticket if titlekey crypto
+            if (entry.IsRightsIdValid() && !CONVERT_TO_STANDARD_CRYTPO && !LOWER_MASTER_KEY) {
                 char tik_name[FS_MAX_PATH], cert_name[FS_MAX_PATH];
                 std::sprintf(tik_name, "/%s.tik", hexIdToStr(entry.ncm_rights_id.rights_id).str);
                 std::sprintf(cert_name, "/%s.cert", hexIdToStr(entry.ncm_rights_id.rights_id).str);
