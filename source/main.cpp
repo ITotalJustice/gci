@@ -59,7 +59,7 @@ bool FIX_DISTRIBUTION_BIT{false};
 
 // converts titlekey to standard crypto, also known as "ticketless".
 // this will not work with addon, so, addon tickets will be installed.
-bool CONVERT_TO_STANDARD_CRYTPO{false};
+bool CONVERT_TO_STANDARD_CRYPTO{false};
 
 // encrypts the keak with master key 0, this allows the game to be launched
 // on every fw. Also implicitly does standard crypto.
@@ -69,6 +69,11 @@ bool LOWER_MASTER_KEY{false};
 // if mkey is higher than fw version, the game still won't launch
 // as the fw won't have the key to decrypt keak.
 bool LOWER_SYSTEM_VERSION{false};
+
+// per-type overrides, for testing patches.
+bool CONVERT_BASE_TO_STANDARD_CRYTPO{false};
+bool CONVERT_UPDATE_TO_STANDARD_CRYTPO{true};
+bool CONVERT_DLC_TO_STANDARD_CRYTPO{true};
 
 enum NsApplicationRecordType {
     // installed
@@ -798,6 +803,16 @@ Result gci_install(NcmStorageId storage_id) {
             if (entry.GetType() != meta_type) {
                 continue;
             }
+
+            bool convert_to_standard_crypto = CONVERT_TO_STANDARD_CRYPTO;
+            if (CONVERT_BASE_TO_STANDARD_CRYTPO && entry.GetType() == NcmContentMetaType_Application) {
+                convert_to_standard_crypto = CONVERT_BASE_TO_STANDARD_CRYTPO;
+            } else if (CONVERT_UPDATE_TO_STANDARD_CRYTPO && entry.GetType() == NcmContentMetaType_Patch) {
+                convert_to_standard_crypto = CONVERT_UPDATE_TO_STANDARD_CRYTPO;
+            } else if (CONVERT_DLC_TO_STANDARD_CRYTPO && entry.GetType() == NcmContentMetaType_AddOnContent) {
+                convert_to_standard_crypto = CONVERT_DLC_TO_STANDARD_CRYTPO;
+            }
+
             consolePrint("Installing Type: 0x%X\n", entry.GetType());
 
             // cleanup all placeholders on error.
@@ -832,7 +847,7 @@ Result gci_install(NcmStorageId storage_id) {
                     nca_header.distribution_type = NcaDistributionType_System;
                 }
 
-                if ((CONVERT_TO_STANDARD_CRYTPO && isRightsIdValid(nca_header.rights_id)) || LOWER_MASTER_KEY) {
+                if ((convert_to_standard_crypto && isRightsIdValid(nca_header.rights_id)) || LOWER_MASTER_KEY) {
                     u8 keak_generation;
 
                     if (isRightsIdValid(nca_header.rights_id)) {
@@ -859,7 +874,8 @@ Result gci_install(NcmStorageId storage_id) {
                         nca_header.key_area[0x2] = title_key;
 
                         keak_generation = key_gen;
-                    } else if (LOWER_MASTER_KEY) {
+                    } else /*if (LOWER_MASTER_KEY)*/ {
+                        keak_generation = nca_header.GetKeyGeneration();
                         R_TRY(NcaDecryptKeak(keys, nca_header));
                     }
 
@@ -1006,7 +1022,7 @@ Result gci_install(NcmStorageId storage_id) {
             }
 
             // install ticket if titlekey crypto
-            if (entry.IsRightsIdValid() && !CONVERT_TO_STANDARD_CRYTPO && !LOWER_MASTER_KEY) {
+            if (entry.IsRightsIdValid() && !convert_to_standard_crypto && !LOWER_MASTER_KEY) {
                 char tik_name[FS_MAX_PATH], cert_name[FS_MAX_PATH];
                 std::sprintf(tik_name, "/%s.tik", hexIdToStr(entry.ncm_rights_id.rights_id).str);
                 std::sprintf(cert_name, "/%s.cert", hexIdToStr(entry.ncm_rights_id.rights_id).str);
