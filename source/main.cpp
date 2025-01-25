@@ -800,6 +800,13 @@ Result gci_install(NcmStorageId storage_id) {
             }
             consolePrint("Installing Type: 0x%X\n", entry.GetType());
 
+            // cleanup all placeholders on error.
+            ON_SCOPE_EXIT(
+                for (auto& nca : entry.ncas) {
+                    ncmContentStorageDeletePlaceHolder(std::addressof(cs), std::addressof(nca.placeholder_id));
+                }
+            );
+
             // install all ncas
             for (auto& nca : entry.ncas) {
                 R_TRY(ncmContentStorageGeneratePlaceHolderId(std::addressof(cs), std::addressof(nca.placeholder_id)));
